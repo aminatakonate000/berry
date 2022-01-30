@@ -8,23 +8,119 @@ Yarn now accepts sponsorships! Please give a look at our [OpenCollective](https:
 
 **Note:** features in `master` can be tried out by running `yarn set version from sources` in your project (existing contrib plugins are updated automatically, while new contrib plugins can be added by running `yarn plugin import from sources <name>`).
 
-### Bugfixes
+Various improvements have been made in the core to improve performance. Additionally:
 
-- Direct portal dependencies for `node_modules` install are given priority during hoisting now, to prevent cases when indirect regular dependencies take place in the install tree first and block the way for direct portal dependencies.
-- Usage of `pnpify` inside directories containing spaces is now possible.
-- Hoisting algorithm speedup, impacts recurrent `node_modules` installs time.
-- CLI bundles built from sources output `commit` hash instead of `tree` hash as part of their version
-- `workspaces foreach run` now handles the fact that a script containing `:` only becomes global if it exists in one workspace.
-- The PnP compatibility patch for `resolve` will no longer resolve missing modules to a file with the same name located next to the issuer
-- `logFilters` using `pattern` matchers now match any part of the log entry
-- The cache is now fully atomic when moving files across devices and in general more efficient.
-- The PnP patch now picks up changes to the `fs` module, allowing users to patch it.
-- When using PnP, `require.resolve('pnpapi')` will be handled correctly even when using `exports`.
+### Commands
+
+- The `yarn workspaces foreach run` command is now able to run binaries.
+- The `yarn npm info` command now supports displaying information about a tagged version of a package (e.g. `yarn npm info vue@next`).
+- A new `yarn explain` command has been added. It can be used to explain an error code, or list all available error codes.
+  - For example, try to run `yarn explain YN0002`.
+- The `yarn npm publish` command now accepts a new `--otp` option, to set the One-Time Password from the CLI.
+  - A better error message will also be shown when a query fails due to an invalid OTP.
+- `yarn upgrade-interactive` now has improved paging:
+  - Yarn will display as many suggestions as can fit in the viewport (rather than a fixed-size list).
+  - The suggestions that fit in the viewport will be fetched in the foreground and will load one-by-one.
+  - The suggestions that don't will be fetched in the background and will be loaded in batches to increase responsiveness and reduce input lag.
+  - Most notably, you won't have to wait for all of the suggestions to be fetched (which took a very long time before on large monorepos) before you can start navigating through the list.
 
 ### Installs
 
-- `hardlinks-global` node modules mode is automatically downgraded to `hardlinks-local` when global cache and install folder are on a different devices and the install continues normally. Warning is produced to the user with mitigation steps provided in documentation.
-- The nm linker maximizes chances to end-up with only one top-level node_modules in the case of using workspaces
+- The node-modules linker now tolerates if `node_modules` is a symbolic link, and doesn't recreate it.
+- On top of the `cpu` and `arch` fields, Yarn now support a new `libc` field which can be used in tandem with `optionalDependencies` to avoid downloading packages that have been linked against incompatible standard libraries (we currently support two values: `glibc` and `musl`).
+- The pnpm linker has received various improvements:
+  - It will now remove the `node_modules/.store` and `node_modules` folders if they are empty.
+  - It now supports running binaries of soft links.
+  - It will now create self-references for packages that don't depend on other versions of themselves.
+  - It will now remove scope folders (e.g. `node_modules/@yarnpkg`) if they are empty or after removing a scoped dependency.
+- All `.pnp.cjs` files with inlined data will now store the data in a JSON string literal instead of an object literal [to improve startup performance](https://v8.dev/blog/cost-of-javascript-2019#json).
+
+### Compatibility
+
+- The shell now treats backslashes same as Bash (so it mostly ignore them).
+  - Could potentially be a breaking change, but the old behavior caused portability issues with a few packages, so we had to make this change (especially since the portable shell is intended to help portability).
+- The shell now supports `${FOO:+}`.
+- The PnP filesystem now handles `read` and `readSync` using options.
+- The PnP filesystem now handles UNC paths using forward slashes.
+- The PnP filesystem now sets the proper `path` property on streams created by `createReadStream()` and obtained from zip archives.
+- The PnP runtime now throws an `ERR_REQUIRE_ESM` error when attempting to require an ES Module, matching the default Node.js behaviour.
+- Updates the PnP compatibility layer for TypeScript 4.6 Beta (it's possible we'll need to publish another patch update once the 4.6 enters stable).
+
+### Bugfixes
+
+- `@yarnpkg/pnpify` now escapes paths correctly.
+- The ESM loader is now enabled regardless of the entrypoint module type, this fixes support for dynamic imports in commonjs modules when the entrypoint is also commonjs.
+- The ESM loader is now able to resolve relative imports with search parameters.
+- The `node` field inside the `npm_config_user_agent` Yarn sets will now include a leading `v`.
+- Yarn is now able to recover from a corrupted install state.
+- Yarn is now able to migrate classic lockfiles containing unconventional tarball URLs.
+- The nm linker hoists portals after hoisting their dependencies first.
+- Fixed a crash caused by a bad interaction between aliased packages and peer dependencies.
+- The ESBuild plugin will no longer allow access to Node.js builtins if the `platform` isn't set to Node.
+- SemVer ranges with build metadata can now be resolved.
+
+### ZipFS Extension
+
+- You can now unmount zip folders by right-clicking on their workspaces.
+
+### Miscellaneous Features
+
+- Reporting for Git errors has been improved.
+- The resolution step now has a progress indicator.
+- The experimental ESM loader warning emitted by Node.js is now suppressed.
+- Private registries can now be authenticated using private keys and certificates.
+- A new `wrapNetworkRequest` hook now lets you wrap network requests (for example to log them).
+
+## 3.1.1
+
+- Updates the PnP compatibility layer for TypeScript 4.5
+
+## 3.1.0
+
+### Commands
+
+- The `yarn workspaces list` and `yarn workspaces foreach` commands now both support a new `--since` option that lets you filter the workspace list by changes (only workspaces that changed since the specified commit will be iterated on). This feature is still a little experimental, especially when used with `-R,--recursive`.
+- The `yarn workspaces foreach` command now handles the fact that a script containing `:` only becomes global if it exists in exactly one workspace.
+- The `yarn workspaces foreach` command now supports `--jobs 1` and `--jobs unlimited`.
+- The `yarn init -2` command will now add the [`packageManager`](https://nodejs.org/api/packages.html#packagemanager) field to your project manifest.
+
+### Settings
+
+- The `pattern` matcher from `logFilters` will now match any part of the log entry.
+
+### Installs
+
+- A new `nodeLinker: pnpm` mode will let you install packages using the pnpm install strategy, where packages are stored flat and referenced by each others through symlinks. This mode is still a little experimental, so please send our way bugs you might find.
+- Yarn won't install anymore packages that don't match the current OS. Should you need to (for example if you check-in your cache), use the [`supportedArchitectures`](https://yarnpkg.com/configuration/yarnrc#supportedArchitectures) field to manually enforce the presence of specific architectures.
+- The `nmMode: hardlinks-global` setting will now be automatically downgraded to `nmMode: hardlinks-local` when global caches and install folders are kept on different devices, thus letting the install continue normally. A warning will still be produced explaining this behaviour.
+- The `node_modules` linker maximizes chances to end-up with only one top-level node_modules in the case of using workspaces
+- The `nmSelfReferences` setting has been added to the nm linker to control whether workspaces are allowed to require themselves - results in creation of self-referencing symlinks. `yarn workspaces focus` will not create self-referencing symlinks for excluded workspaces anymore.
+- Yarn can now install workspaces from remote git repositories that use npm if npm@>=7.x is installed on the system.
+- The hoisting algorithm should be faster, improving the install time for recurrent `node_modules` installs.
+
+### Miscellaneous Features
+
+- Workspaces can now be referred to using `workspace:^` and `workspace:~`. When published, those markers will turn into the actual version (just like what used to happen with `workspace:*`), except that they'll be prefixed with the relevant semver prefix (respectively `^` and `~`).
+- A new `npmAuditRegistry` setting will let you define which registry to use when running audits. If unset, we'll fallback to the currently configured publish registry (we'll likely change this behavior in Yarn 4 to rather use the fetch registry).
+
+### Bugfixes
+
+- Direct portal dependencies for `node_modules` installs will now be given priority during hoisting, preventing cases when indirect regular dependencies would block the way for direct portal dependencies.
+- The `pnpify` binary can now be used from inside directories containing spaces.
+- The CLI bundles built from sources will now output the commit hash instead of the tree hash, as part of their `--version` string.
+- Nested workspaces are properly hoisted by `node-modules` linker.
+- Self-referencing symlinks won't be created for anonymous workspaces when using the `node-modules` linker, since they cannot be used from the code anyway.
+- The cache is now fully atomic when moving files across devices, and is more efficient in general.
+- The PnP patch will now properly pick up changes to the `fs` module, allowing users to patch it.
+- When using PnP, `require.resolve('pnpapi')` will be handled correctly even when using `exports`.
+- The install state will no longer be invalidated after running commands that modify the lockfile; this should bring a significant performance improvement when running commands such as `yarn run` immediately after adding or removing dependencies inside large monorepos.
+- Optional peer dependencies now imply an optional peer dependency on the corresponding `@types` version. This matches the behaviour for peer dependencies.
+
+### Compatibility
+
+- Yarn will now generate an experimental ESM loader when it detects you may need it. This can be disabled (or enabled) using [`pnpEnableEsmLoader`](https://yarnpkg.com/configuration/yarnrc#pnpEnableEsmLoader).
+- The PnP compatibility patch for `resolve` will no longer resolve missing modules to a file with the same name that would happen to be located next to the issuer.
+- Fixes the SDK to account for a breaking change in VSCode >=1.61.
 
 ## 3.0.2
 

@@ -1,26 +1,26 @@
 import {PortablePath, npath, toFilename} from '@yarnpkg/fslib';
+import assert                            from 'assert';
 import crypto                            from 'crypto';
 import finalhandler                      from 'finalhandler';
 import https                             from 'https';
-import http                              from 'http';
 import {IncomingMessage, ServerResponse} from 'http';
+import http                              from 'http';
 import invariant                         from 'invariant';
 import {AddressInfo}                     from 'net';
 import pem                               from 'pem';
 import semver                            from 'semver';
 import serveStatic                       from 'serve-static';
 import {promisify}                       from 'util';
+import {v5 as uuidv5}                    from 'uuid';
+import {Gzip}                            from 'zlib';
+
+import {ExecResult}                      from './exec';
+import * as fsUtils                      from './fs';
 
 const deepResolve = require(`super-resolve`);
-
 const staticServer = serveStatic(npath.fromPortablePath(require(`pkg-tests-fixtures`)));
 
-import {Gzip}       from 'zlib';
-
-import {ExecResult} from './exec';
-import * as fsUtils from './fs';
-
-export type PackageEntry = Map<string, {path: string, packageJson: Object}>;
+export type PackageEntry = Map<string, {path: string, packageJson: Record<string, any>}>;
 export type PackageRegistry = Map<string, PackageEntry>;
 
 interface RunDriverOptions extends Record<string, any> {
@@ -36,7 +36,88 @@ export type PackageRunDriver = (
   opts: RunDriverOptions,
 ) => Promise<ExecResult>;
 
+export enum RequestType {
+  Login = `login`,
+  PackageInfo = `packageInfo`,
+  PackageTarball = `packageTarball`,
+  Whoami = `whoami`,
+  Repository = `repository`,
+  Publish = `publish`,
+}
+
+export type Request = {
+  type: RequestType.Login;
+  username: string;
+} | {
+  type: RequestType.PackageInfo;
+  scope?: string;
+  localName: string;
+} | {
+  type: RequestType.PackageTarball;
+  scope?: string;
+  localName: string;
+  version?: string;
+} | {
+  type: RequestType.Whoami;
+  login: Login;
+} | {
+  type: RequestType.Repository;
+} | {
+  type: RequestType.Publish;
+  scope?: string;
+  localName: string;
+};
+
+export class Login {
+  username: string;
+  password: string;
+
+  npmOtpToken: string | null;
+  npmAuthToken: string | null;
+
+  npmAuthIdent: {
+    decoded: string;
+    encoded: string;
+  };
+
+  constructor(username: string, {otp}: {otp?: boolean} = {}) {
+    this.username = username;
+    this.password = crypto.createHash(`sha1`).update(username).digest(`hex`);
+
+    this.npmOtpToken = otp ? Buffer.from(this.password, `hex`).slice(0, 4).join(``) : null;
+    this.npmAuthToken = uuidv5(this.password, `06030d6c-8c43-412a-ad0a-787f1fb9e31e`);
+
+    const authIdent = `${this.username}:${this.password}`;
+
+    this.npmAuthIdent = {
+      decoded: authIdent,
+      encoded: Buffer.from(authIdent).toString(`base64`),
+    };
+  }
+}
+
+export const validLogins = {
+  fooUser: new Login(`foo-user`),
+  barUser: new Login(`bar-user`),
+  otpUser: new Login(`otp-user`, {otp: true}),
+} as const;
+
 let whitelist = new Map();
+let recording: Array<Request> | null = null;
+
+export const startRegistryRecording = async (
+  fn: () => Promise<void>,
+) => {
+  const currentRecording: Array<Request> = [];
+  recording = currentRecording;
+
+  try {
+    await fn();
+    return currentRecording;
+  } finally {
+    recording = null;
+  }
+};
 
 export const setPackageWhitelist = async (
   packages: Map<string, Set<string>>,
@@ -176,41 +257,27 @@ export const getPackageDirectoryPath = async (
 };
 
 const packageServerUrls: {
-  http: string | null,
-  https: string | null,
+  http: Promise<string> | null;
+  https: Promise<string> | null;
 } = {http: null, https: null};
 
 export const startPackageServer = ({type}: { type: keyof typeof packageServerUrls } = {type: `http`}): Promise<string> => {
   const serverUrl = packageServerUrls[type];
-
   if (serverUrl !== null)
-    return Promise.resolve(serverUrl);
+    return serverUrl;
 
-  enum RequestType {
-    Login = `login`,
-    PackageInfo = `packageInfo`,
-    PackageTarball = `packageTarball`,
-    Whoami = `whoami`,
-    Repository = `repository`,
-  }
+  const applyOtpValidation = (req: IncomingMessage, res: ServerResponse, user: Login) => {
+    const otp = req.headers[`npm-otp`];
+    if (user.npmOtpToken === null || otp === user.npmOtpToken)
+      return true;
 
-  type Request = {
-    type: RequestType.Login;
-    username: string,
-  } | {
-    type: RequestType.PackageInfo;
-    scope?: string;
-    localName: string;
-  } | {
-    type: RequestType.PackageTarball;
-    scope?: string;
-    localName: string;
-    version?: string;
-  } | {
-    type: RequestType.Whoami;
-    login: Login
-  } | {
-    type: RequestType.Repository;
+    res.writeHead(401, {
+      [`Content-Type`]: `application/json`,
+      [`www-authenticate`]: `OTP`,
+    });
+
+    res.end();
+    return false;
   };
 
   const processors: {[requestType in RequestType]: (parsedRequest: Request, request: IncomingMessage, response: ServerResponse) => Promise<void>} = {
@@ -232,6 +299,22 @@ export const startPackageServer = ({type}: { type: keyof typeof packageServerUrl
       const whitelistedVersions = whitelist.get(name);
       if (whitelistedVersions)
         versions = versions.filter(version => whitelistedVersions.has(version));
+
+      const allDistTags = versions.map(version => {
+        const packageVersionEntry = packageEntry.get(version);
+        invariant(packageVersionEntry, `This can only exist`);
+
+        return packageVersionEntry!.packageJson[`dist-tags`];
+      });
+
+      const distTags = allDistTags[0];
+
+      // If a package defines dist-tags, all of its versions must define the same dist-tags
+      for (const versionDistTags of allDistTags.slice(1))
+        assert.deepStrictEqual(versionDistTags, distTags);
+
+      if (typeof distTags === `object` && distTags !== null && !Object.prototype.hasOwnProperty.call(distTags, `latest`))
+        throw new Error(`Assertion failed: The package "${name}" must define a "latest" dist-tag too if it defines any dist-tags`);
 
       const data = JSON.stringify({
         name,
@@ -255,7 +338,10 @@ export const startPackageServer = ({type}: { type: keyof typeof packageServerUrl
             }),
           )),
         ),
-        [`dist-tags`]: {latest: semver.maxSatisfying(versions, `*`)},
+        [`dist-tags`]: {
+          latest: semver.maxSatisfying(versions, `*`),
+          ...distTags,
+        },
       });
 
       response.writeHead(200, {[`Content-Type`]: `application/json`});
@@ -306,38 +392,30 @@ export const startPackageServer = ({type}: { type: keyof typeof packageServerUrl
       if (parsedRequest.type !== RequestType.Login)
         throw new Error(`Assertion failed: Invalid request type`);
 
-      const {username} = parsedRequest;
-      const otp = request.headers[`npm-otp`];
+      const user = [...Object.values(validLogins)].find(user => {
+        return user.username === parsedRequest.username;
+      });
 
-      const user = validLogins[username];
-      if (!user) {
+      if (typeof user === `undefined`) {
         processError(response, 401, `Unauthorized`);
         return;
       }
 
-      if (user.requiresOtp && user.otp !== otp) {
-        response.writeHead(401, {
-          [`Content-Type`]: `application/json`,
-          [`www-authenticate`]: `OTP`,
-        });
-
-        response.end();
+      if (!applyOtpValidation(request, response, user))
         return;
-      }
 
       let rawData = ``;
 
       request.on(`data`, chunk => rawData += chunk);
       request.on(`end`, () => {
         let body;
-
         try {
           body = JSON.parse(rawData);
         } catch (e) {
           return processError(response, 401, `Unauthorized`);
         }
 
-        if (body.name !== username || body.password !== user.password)
+        if (body.name !== user.username || body.password !== user.password)
           return processError(response, 401, `Unauthorized`);
 
         const data = JSON.stringify({token: user.npmAuthToken});
@@ -350,6 +428,35 @@ export const startPackageServer = ({type}: { type: keyof typeof packageServerUrl
 
     async [RequestType.Repository](parsedRequest, request, response) {
       staticServer(request as any, response as any, finalhandler(request, response));
+    },
+    async [RequestType.Publish](parsedRequest, request, response) {
+      if (parsedRequest.type !== RequestType.Publish)
+        throw new Error(`Assertion failed: Invalid request type`);
+
+      const {scope, localName} = parsedRequest;
+      const name = scope ? `${scope}/${localName}` : localName;
+
+      let rawData = ``;
+
+      request.on(`data`, chunk => rawData += chunk);
+      request.on(`end`, () => {
+        let body;
+        try {
+          body = JSON.parse(rawData);
+        } catch (e) {
+          return processError(response, 401, `Invalid`);
+        }
+
+        const [version] = Object.keys(body.versions);
+        if (!body.versions[version].gitHead && name === `githead-required`)
+          return processError(response, 400, `Missing gitHead`);
+
+        if (typeof body.versions[version].gitHead !== `undefined` && name === `githead-forbidden`)
+          return processError(response, 400, `Unexpected gitHead`);
+
+        response.writeHead(200, {[`Content-Type`]: `application/json`});
+        return response.end(rawData);
+      });
     },
   };
 
@@ -365,7 +472,7 @@ export const startPackageServer = ({type}: { type: keyof typeof packageServerUrl
     sendError(res, statusCode, errorMessage);
   };
 
-  const parseRequest = (url: string): Request | null => {
+  const parseRequest = (url: string, method: string): Request | null => {
     let match: RegExpMatchArray | null;
 
     url = url.replace(/%2f/g, `/`);
@@ -386,6 +493,14 @@ export const startPackageServer = ({type}: { type: keyof typeof packageServerUrl
         type: RequestType.Whoami,
         // Set later when login is parsed
         login: null as any,
+      };
+    } else if ((match = url.match(/^\/(?:(@[^/]+)\/)?([^@/][^/]*)$/)) && method == `PUT`) {
+      const [, scope, localName] = match;
+
+      return {
+        type: RequestType.Publish,
+        scope,
+        localName,
       };
     } else if ((match = url.match(/^\/(?:(@[^/]+)\/)?([^@/][^/]*)$/))) {
       const [, scope, localName] = match;
@@ -414,6 +529,7 @@ export const startPackageServer = ({type}: { type: keyof typeof packageServerUrl
 
   const needsAuth = (parsedRequest: Request): boolean => {
     switch (parsedRequest.type) {
+      case RequestType.Publish:
       case RequestType.Whoami:
         return true;
 
@@ -432,61 +548,39 @@ export const startPackageServer = ({type}: { type: keyof typeof packageServerUrl
     }
   };
 
-  interface Login {
-    username: string;
-    password: string;
-    requiresOtp: boolean;
-    otp?: string;
-    npmAuthToken: string;
+  const validAuthorizations = new Map<string, Login>();
+
+  for (const user of Object.values(validLogins)) {
+    validAuthorizations.set(`Bearer ${user.npmAuthToken}`, user);
+    validAuthorizations.set(`Basic ${user.npmAuthIdent.encoded}`, user);
   }
 
-  const validLogins: Record<string, Login> = {
-    testUser: {
-      username: `testUser`,
-      password: `password`,
-      requiresOtp: true,
-      otp: `1234`,
-      npmAuthToken: `686159dc-64b3-413e-a244-2de2b8d1c36f`,
-    },
-    anotherTestUser: {
-      username: `anotherTestUser`,
-      password: `password123`,
-      requiresOtp: false,
-      npmAuthToken: `316158de-64b3-413e-a244-2de2b8d1c80f`,
-    },
-    username: {
-      username: `username`,
-      password: `a very secure password`,
-      npmAuthToken: `123456df-64b3-413e-a244-2de2b8d1c80f`,
-      requiresOtp: false,
-    },
-  };
-
-  const validAuthorizations = new Map<string, Login>([
-    [`Bearer 686159dc-64b3-413e-a244-2de2b8d1c36f`, validLogins.testUser],
-    [`Bearer 316158de-64b3-413e-a244-2de2b8d1c80f`, validLogins.anotherTestUser],
-    [`Basic dXNlcm5hbWU6YSB2ZXJ5IHNlY3VyZSBwYXNzd29yZA==`, validLogins.username],
-  ]);
-
-  return new Promise((resolve, reject) => {
+  return packageServerUrls[type] = new Promise((resolve, reject) => {
     const listener: http.RequestListener = (req, res) =>
       void (async () => {
         try {
-          const parsedRequest = parseRequest(req.url!);
-
+          const parsedRequest = parseRequest(req.url!, req.method!);
           if (parsedRequest == null) {
             processError(res, 404, `Invalid route: ${req.url}`);
             return;
           }
 
+          if (recording !== null)
+            recording.push(parsedRequest);
+
           const {authorization} = req.headers;
           if (authorization != null) {
-            const auth = validAuthorizations.get(authorization);
-            if (!auth) {
+            const user = validAuthorizations.get(authorization);
+            if (!user) {
               sendError(res, 401, `Invalid token`);
               return;
-            } else if (parsedRequest.type === RequestType.Whoami) {
-              parsedRequest.login = auth;
+            }
+
+            if (!applyOtpValidation(req, res, user))
+              return;
+
+            if (parsedRequest.type === RequestType.Whoami) {
+              parsedRequest.login = user;
             }
           } else if (needsAuth(parsedRequest)) {
             sendError(res, 401, `Authentication required`);
@@ -520,7 +614,7 @@ export const startPackageServer = ({type}: { type: keyof typeof packageServerUrl
       server.unref();
       server.listen(() => {
         const {port} = server.address() as AddressInfo;
-        resolve((packageServerUrls[type] = `${type}://localhost:${port}`));
+        resolve(`${type}://localhost:${port}`);
       });
     })();
   });
@@ -532,12 +626,15 @@ export interface PackageDriver {
   withConfig: (definition: Record<string, any>) => PackageDriver;
 }
 
+export type Run = (...args: Array<string> | [...Array<string>, Partial<RunDriverOptions>]) => Promise<ExecResult>;
+export type Source = (script: string, callDefinition?: Record<string, any>) => Promise<Record<string, any>>;
+
 export type RunFunction = (
   {path, run, source}:
   {
-    path: PortablePath,
-    run: (...args: Array<string> | [...Array<string>, Partial<RunDriverOptions>]) => Promise<ExecResult>,
-    source: (script: string, callDefinition?: Record<string, any>) => Promise<Record<string, any>>
+    path: PortablePath;
+    run: Run;
+    source: Source;
   }
 ) => void;
 
@@ -545,8 +642,8 @@ export const generatePkgDriver = ({
   getName,
   runDriver,
 }: {
-  getName: () => string,
-  runDriver: PackageRunDriver,
+  getName: () => string;
+  runDriver: PackageRunDriver;
 }): PackageDriver => {
   const withConfig = (definition: Record<string, any>): PackageDriver => {
     const makeTemporaryEnv: PackageDriver = (packageJson, subDefinition, fn) => {

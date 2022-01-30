@@ -38,6 +38,7 @@ export interface PublishConfig {
 
 export interface InstallConfig {
   hoistingLimits?: string;
+  selfReferences?: boolean;
 }
 
 export class Manifest {
@@ -47,6 +48,7 @@ export class Manifest {
   public version: string | null = null;
   public os: Array<string> | null = null;
   public cpu: Array<string> | null = null;
+  public libc: Array<string> | null = null;
 
   public type: string | null = null;
 
@@ -95,10 +97,14 @@ export class Manifest {
   static async tryFind(path: PortablePath, {baseFs = new NodeFS()}: {baseFs?: FakeFS<PortablePath>} = {}) {
     const manifestPath = ppath.join(path, `package.json` as Filename);
 
-    if (!await baseFs.existsPromise(manifestPath))
-      return null;
+    try {
+      return await Manifest.fromFile(manifestPath, {baseFs});
+    } catch (err) {
+      if (err.code === `ENOENT`)
+        return null;
 
-    return await Manifest.fromFile(manifestPath, {baseFs});
+      throw err;
+    }
   }
 
   static async find(path: PortablePath, {baseFs}: {baseFs?: FakeFS<PortablePath>} = {}) {
@@ -230,6 +236,21 @@ export class Manifest {
       this.cpu = null;
     }
 
+    if (Array.isArray(data.libc)) {
+      const libc: Array<string> = [];
+      this.libc = libc;
+
+      for (const item of data.libc) {
+        if (typeof item !== `string`) {
+          errors.push(new Error(`Parsing failed for the 'libc' field`));
+        } else {
+          libc.push(item);
+        }
+      }
+    } else {
+      this.libc = null;
+    }
+
     if (typeof data.type === `string`)
       this.type = data.type;
     else
@@ -295,7 +316,22 @@ export class Manifest {
           continue;
         }
 
-        this.bin.set(key, normalizeSlashes(value));
+        // Some registries incorrectly normalize the `bin` field of
+        // scoped packages to be invalid filenames.
+        // E.g. from
+        // {
+        //   "name": "@yarnpkg/doctor",
+        //   "bin": "index.js"
+        // }
+        // to
+        // {
+        //   "name": "@yarnpkg/doctor",
+        //   "bin": {
+        //     "@yarnpkg/doctor": "index.js"
+        //   }
+        // }
+        const binaryIdent = structUtils.parseIdent(key);
+        this.bin.set(binaryIdent.name, normalizeSlashes(value));
       }
     }
 
@@ -555,6 +591,12 @@ export class Manifest {
           } else {
             errors.push(new Error(`Invalid hoisting limits definition`));
           }
+        } else if (key == `selfReferences`) {
+          if (typeof data.installConfig.selfReferences == `boolean`) {
+            this.installConfig.selfReferences = data.installConfig.selfReferences;
+          } else {
+            errors.push(new Error(`Invalid selfReferences definition, must be a boolean value`));
+          }
         } else {
           errors.push(new Error(`Unrecognized installConfig key: ${key}`));
         }
@@ -658,10 +700,29 @@ export class Manifest {
     return false;
   }
 
+  getConditions() {
+    const fields: Array<string> = [];
+
+    if (this.os && this.os.length > 0)
+      fields.push(toConditionLine(`os`, this.os));
+    if (this.cpu && this.cpu.length > 0)
+      fields.push(toConditionLine(`cpu`, this.cpu));
+    if (this.libc && this.libc.length > 0)
+      fields.push(toConditionLine(`libc`, this.libc));
+
+    return fields.length > 0 ? fields.join(` & `) : null;
+  }
+
+  /**
+   * @deprecated Prefer getConditions() instead
+   */
   isCompatibleWithOS(os: string): boolean {
     return Manifest.isManifestFieldCompatible(this.os, os);
   }
 
+  /**
+   * @deprecated Prefer getConditions() instead
+   */
   isCompatibleWithCPU(cpu: string): boolean {
     return Manifest.isManifestFieldCompatible(this.cpu, cpu);
   }
@@ -975,4 +1036,23 @@ function tryParseOptionalBoolean(value: unknown, {yamlCompatibilityMode}: {yamlC
     return value;
 
   return null;
+}
+
+function toConditionToken(name: string, raw: string) {
+  const index = raw.search(/[^!]/);
+  if (index === -1)
+    return `invalid`;
+
+  const prefix = index % 2 === 0 ? `` : `!`;
+  const value = raw.slice(index);
+
+  return `${prefix}${name}=${value}`;
+}
+
+function toConditionLine(name: string, rawTokens: Array<string>) {
+  if (rawTokens.length === 1) {
+    return toConditionToken(name, rawTokens[0]);
+  } else {
+    return `(${rawTokens.map(raw => toConditionToken(name, raw)).join(` | `)})`;
+  }
 }

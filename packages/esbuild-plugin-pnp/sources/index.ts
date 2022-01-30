@@ -49,7 +49,7 @@ async function defaultOnLoad(args: OnLoadArgs): Promise<OnLoadResult> {
 
 type OnResolveParams = {
   resolvedPath: string | null;
-  watchFiles: Array<string>
+  watchFiles: Array<string>;
   error?: Error;
 };
 
@@ -81,11 +81,11 @@ async function defaultOnResolve(args: OnResolveArgs, {resolvedPath, error, watch
 }
 
 export type PluginOptions = {
-  baseDir?: string,
-  extensions?: Array<string>,
-  filter?: RegExp,
-  onResolve?: (args: OnResolveArgs, params: OnResolveParams) => Promise<OnResolveResult | null>,
-  onLoad?: (args: OnLoadArgs) => Promise<OnLoadResult>,
+  baseDir?: string;
+  extensions?: Array<string>;
+  filter?: RegExp;
+  onResolve?: (args: OnResolveArgs, params: OnResolveParams) => Promise<OnResolveResult | null>;
+  onLoad?: (args: OnLoadArgs) => Promise<OnLoadResult>;
 };
 
 export function pnpPlugin({
@@ -103,6 +103,8 @@ export function pnpPlugin({
         return;
 
       const externals = parseExternals(build.initialOptions.external ?? []);
+
+      const isPlatformNode = (build.initialOptions.platform ?? `browser`) === `node`;
 
       build.onResolve({filter}, args => {
         if (isExternal(args.path, externals))
@@ -122,7 +124,7 @@ export function pnpPlugin({
         let error;
         try {
           path = pnpApi.resolveRequest(args.path, effectiveImporter, {
-            considerBuiltins: true,
+            considerBuiltins: isPlatformNode,
             extensions,
           });
         } catch (e) {

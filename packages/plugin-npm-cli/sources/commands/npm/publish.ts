@@ -38,6 +38,10 @@ export default class NpmPublishCommand extends BaseCommand {
     description: `Warn and exit when republishing an already existing version of a package`,
   });
 
+  otp = Option.String(`--otp`, {
+    description: `The OTP token to use with the command`,
+  });
+
   async execute() {
     const configuration = await Configuration.find(this.context.cwd, this.context.plugins);
     const {project, workspace} = await Project.find(configuration, this.context.cwd);
@@ -97,16 +101,19 @@ export default class NpmPublishCommand extends BaseCommand {
         const pack = await packUtils.genPackStream(workspace, files);
         const buffer = await miscUtils.bufferStream(pack);
 
+        const gitHead = await npmPublishUtils.getGitHead(workspace.cwd);
         const body = await npmPublishUtils.makePublishBody(workspace, buffer, {
           access: this.access,
           tag: this.tag,
           registry,
+          gitHead,
         });
 
         await npmHttpUtils.put(npmHttpUtils.getIdentUrl(ident), body, {
           configuration,
           registry,
           ident,
+          otp: this.otp,
           jsonResponse: true,
         });
       });

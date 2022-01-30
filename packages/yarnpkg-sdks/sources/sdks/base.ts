@@ -9,7 +9,7 @@ export const generateEslintBaseWrapper: GenerateBaseWrapper = async (pnpApi: Pnp
   await wrapper.writeManifest();
 
   await wrapper.writeBinary(`bin/eslint.js` as PortablePath);
-  await wrapper.writeFile(`lib/api.js` as PortablePath);
+  await wrapper.writeFile(`lib/api.js` as PortablePath, {requirePath: `` as PortablePath});
 
   return wrapper;
 };
@@ -57,7 +57,7 @@ export const generateTypescriptBaseWrapper: GenerateBaseWrapper = async (pnpApi:
 
       function toEditorPath(str) {
         // We add the \`zip:\` prefix to both \`.zip/\` paths and virtual paths
-        if (isAbsolute(str) && !str.match(/^\\^zip:/) && (str.match(/\\.zip\\//) || isVirtual(str))) {
+        if (isAbsolute(str) && !str.match(/^\\^?(zip:|\\/zip\\/)/) && (str.match(/\\.zip\\//) || isVirtual(str))) {
           // We also take the opportunity to turn virtual paths into physical ones;
           // this makes it much easier to work with workspaces that list peer
           // dependencies, since otherwise Ctrl+Click would bring us to the virtual
@@ -87,8 +87,16 @@ export const generateTypescriptBaseWrapper: GenerateBaseWrapper = async (pnpApi:
               //
               // Ref: https://github.com/microsoft/vscode/issues/105014#issuecomment-686760910
               //
-              case \`vscode\`: {
+              // Update Oct 8 2021: VSCode changed their format in 1.61.
+              // Before | ^zip:/c:/foo/bar.zip/package.json
+              // After  | ^/zip//c:/foo/bar.zip/package.json
+              //
+              case \`vscode <1.61\`: {
                 str = \`^zip:\${str}\`;
+              } break;
+
+              case \`vscode\`: {
+                str = \`^/zip/\${str}\`;
               } break;
 
               // To make "go to definition" work,
@@ -133,8 +141,8 @@ export const generateTypescriptBaseWrapper: GenerateBaseWrapper = async (pnpApi:
           case \`vscode\`:
           default: {
             return process.platform === \`win32\`
-              ? str.replace(/^\\^?zip:\\//, \`\`)
-              : str.replace(/^\\^?zip:/, \`\`);
+              ? str.replace(/^\\^?(zip:|\\/zip)\\/+/, \`\`)
+              : str.replace(/^\\^?(zip:|\\/zip)\\/+/, \`/\`);
           } break;
         }
       }
@@ -162,8 +170,9 @@ export const generateTypescriptBaseWrapper: GenerateBaseWrapper = async (pnpApi:
       let hostInfo = \`unknown\`;
 
       Object.assign(Session.prototype, {
-        onMessage(/** @type {string} */ message) {
-          const parsedMessage = JSON.parse(message)
+        onMessage(/** @type {string | object} */ message) {
+          const isStringMessage = typeof message === 'string';
+          const parsedMessage = isStringMessage ? JSON.parse(message) : message;
 
           if (
             parsedMessage != null &&
@@ -172,11 +181,19 @@ export const generateTypescriptBaseWrapper: GenerateBaseWrapper = async (pnpApi:
             typeof parsedMessage.arguments.hostInfo === \`string\`
           ) {
             hostInfo = parsedMessage.arguments.hostInfo;
+            if (hostInfo === \`vscode\` && process.env.VSCODE_IPC_HOOK && process.env.VSCODE_IPC_HOOK.match(/Code\\/1\\.([1-5][0-9]|60)\\./)) {
+              hostInfo += \` <1.61\`;
+            }
           }
 
-          return originalOnMessage.call(this, JSON.stringify(parsedMessage, (key, value) => {
-            return typeof value === \`string\` ? fromEditorPath(value) : value;
-          }));
+          const processedMessageJSON = JSON.stringify(parsedMessage, (key, value) => {
+            return typeof value === 'string' ? fromEditorPath(value) : value;
+          });
+
+          return originalOnMessage.call(
+            this,
+            isStringMessage ? processedMessageJSON : JSON.parse(processedMessageJSON)
+          );
         },
 
         send(/** @type {any} */ msg) {
@@ -201,17 +218,6 @@ export const generateTypescriptBaseWrapper: GenerateBaseWrapper = async (pnpApi:
   await wrapper.writeFile(`lib/tsserver.js` as PortablePath, {wrapModule: tsServerMonkeyPatch});
   await wrapper.writeFile(`lib/typescript.js` as PortablePath);
   await wrapper.writeFile(`lib/tsserverlibrary.js` as PortablePath, {wrapModule: tsServerMonkeyPatch});
-
-  return wrapper;
-};
-
-export const generateStylelintBaseWrapper: GenerateBaseWrapper = async (pnpApi: PnpApi, target: PortablePath) => {
-  const wrapper = new Wrapper(`stylelint` as PortablePath, {pnpApi, target});
-
-  await wrapper.writeManifest();
-
-  await wrapper.writeBinary(`bin/stylelint.js` as PortablePath);
-  await wrapper.writeFile(`lib/index.js` as PortablePath);
 
   return wrapper;
 };
@@ -241,7 +247,6 @@ export const BASE_SDKS: BaseSdks = [
   [`prettier`, generatePrettierBaseWrapper],
   [`typescript-language-server`, generateTypescriptLanguageServerBaseWrapper],
   [`typescript`, generateTypescriptBaseWrapper],
-  [`stylelint`, generateStylelintBaseWrapper],
   [`svelte-language-server`, generateSvelteLanguageServerBaseWrapper],
   [`flow-bin`, generateFlowBinBaseWrapper],
 ];

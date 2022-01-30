@@ -1,18 +1,23 @@
 import {PortablePath, toFilename}               from '@yarnpkg/fslib';
 import querystring                              from 'querystring';
 import semver                                   from 'semver';
+import {makeParser}                             from 'tinylogic';
 
 import {Configuration}                          from './Configuration';
 import {Workspace}                              from './Workspace';
 import * as formatUtils                         from './formatUtils';
 import * as hashUtils                           from './hashUtils';
 import * as miscUtils                           from './miscUtils';
+import * as nodeUtils                           from './nodeUtils';
 import * as structUtils                         from './structUtils';
 import {IdentHash, DescriptorHash, LocatorHash} from './types';
 import {Ident, Descriptor, Locator, Package}    from './types';
 
 const VIRTUAL_PROTOCOL = `virtual:`;
 const VIRTUAL_ABBREVIATE = 5;
+
+const conditionRegex = /(os|cpu|libc)=([a-z0-9_-]+)/;
+const conditionParser = makeParser(conditionRegex);
 
 /**
  * Creates a package ident.
@@ -119,6 +124,8 @@ export function renamePackage(pkg: Package, locator: Locator): Package {
 
     languageName: pkg.languageName,
     linkType: pkg.linkType,
+
+    conditions: pkg.conditions,
 
     dependencies: new Map(pkg.dependencies),
     peerDependencies: new Map(pkg.peerDependencies),
@@ -426,13 +433,13 @@ export function tryParseLocator(string: string, strict: boolean = false): Locato
 
 type ParseRangeOptions = {
   /** Throw an error if bindings are missing */
-  requireBindings?: boolean,
+  requireBindings?: boolean;
   /** Throw an error if the protocol is missing or is not the specified one */
-  requireProtocol?: boolean | string,
+  requireProtocol?: boolean | string;
   /** Throw an error if the source is missing */
-  requireSource?: boolean,
+  requireSource?: boolean;
   /** Whether to parse the selector as a query string */
-  parseSelector?: boolean,
+  parseSelector?: boolean;
 };
 
 type ParseRangeReturnType<Opts extends ParseRangeOptions> =
@@ -800,4 +807,19 @@ export function prettyDependent(configuration: Configuration, locator: Locator, 
  */
 export function getIdentVendorPath(ident: Ident) {
   return `node_modules/${stringifyIdent(ident)}` as PortablePath;
+}
+
+/**
+ * Returns whether the given package is compatible with the specified environment.
+ */
+export function isPackageCompatible(pkg: Package, architectures: nodeUtils.ArchitectureSet) {
+  if (!pkg.conditions)
+    return true;
+
+  return conditionParser(pkg.conditions, specifier => {
+    const [, name, value] = specifier.match(conditionRegex)!;
+    const supported = architectures[name as keyof typeof architectures];
+
+    return supported ? supported.includes(value) : true;
+  });
 }
